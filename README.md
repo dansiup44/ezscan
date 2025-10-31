@@ -21,7 +21,7 @@ python ezscan.py -i [input file] -o [output file] -t [threads] -p [ports] -n [ti
 
 ---
 
-## Installation
+## Installation:
 ```bash
 git clone https://github.com/dansiup44/ezscan.git
 cd ezscan
