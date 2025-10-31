@@ -5,8 +5,9 @@ import os
 import sys
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Generator
 from datetime import datetime
+import threading
 
 class PortScanner:
     def __init__(self, input_file: str, output_file: str, threads: int, ports: List[int], timeout: float, look: int):
@@ -22,7 +23,6 @@ class PortScanner:
         self.open_ports_found: Set[str] = set()
         self.host_ports: Dict[str, List[int]] = {}
         self.written_hosts: Set[str] = set()
-
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def signal_handler(self, sig, frame):
@@ -44,42 +44,19 @@ class PortScanner:
             self.open_ports_found.add(host)
             self.host_ports.setdefault(host, []).append(port)
             self.host_ports[host] = sorted(set(self.host_ports[host]))
-
             if self.look == 1:
                 if host not in self.written_hosts:
                     self.append_result(host)
                     self.written_hosts.add(host)
-            else:  # look == 2
-                self.update_host_line(host)
+            else:
+                if host not in self.written_hosts:
+                    self.append_result(f"{host}:{','.join(map(str, self.host_ports[host]))}")
+                    self.written_hosts.add(host)
 
     def append_result(self, line: str):
         with self.file_lock:
             with open(self.output_file, 'a') as f:
                 f.write(line + "\n")
-
-    def update_host_line(self, host: str):
-        try:
-            with self.file_lock:
-                if not os.path.exists(self.output_file):
-                    return
-                with open(self.output_file, 'r') as f:
-                    lines = f.readlines()
-
-                new_line = f"{host}:{','.join(map(str, self.host_ports[host]))}\n"
-                found = False
-                with open(self.output_file, 'w') as f:
-                    for line in lines:
-                        if line.strip() and not line.startswith('#'):
-                            if line.strip().startswith(host + ':') or line.strip() == host:
-                                if not found:
-                                    f.write(new_line)
-                                    found = True
-                                continue
-                        f.write(line)
-                    if not found:
-                        f.write(new_line)
-        except:
-            pass
 
     def scan_port(self, host: str, port: int):
         if self.stop_event.is_set():
@@ -93,26 +70,24 @@ class PortScanner:
         except:
             return (host, port, False)
 
-    def parse_ips_from_file(self) -> Set[str]:
-        ips = set()
+    def ip_generator(self) -> Generator[str, None, None]:
         try:
             with open(self.input_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
-                    ips.update(self.parse_ip_input(line))
+                    yield from self.parse_ip_input(line)
         except FileNotFoundError:
             print(f"[!] File {self.input_file} not found!")
             sys.exit(1)
-        return ips
 
-    def parse_ip_input(self, ip_str: str) -> Set[str]:
-        ips = set()
+    def parse_ip_input(self, ip_str: str) -> Generator[str, None, None]:
         try:
             if '/' in ip_str:
                 net = ipaddress.ip_network(ip_str, strict=False)
-                ips.update(str(ip) for ip in net.hosts())
+                for ip in net.hosts():
+                    yield str(ip)
             elif '-' in ip_str and '.' in ip_str.split('-', 1)[0]:
                 s, e = ip_str.split('-', 1)
                 start = ipaddress.ip_address(s.strip())
@@ -121,13 +96,12 @@ class PortScanner:
                     start, end = end, start
                 cur = start
                 while cur <= end:
-                    ips.add(str(cur))
+                    yield str(cur)
                     cur += 1
             else:
-                ips.add(str(ipaddress.ip_address(ip_str.strip())))
+                yield str(ipaddress.ip_address(ip_str.strip()))
         except Exception as e:
             print(f"[!] IP Error '{ip_str}': {e}")
-        return ips
 
     def run(self):
         print("[-] ezscan")
@@ -140,36 +114,35 @@ class PortScanner:
         print(f"[+] Ctrl+C — Stop scan\n")
 
         self.write_header()
-        hosts = self.parse_ips_from_file()
-        print(f"[+] Hosts number: {len(hosts)}")
-
-        if not hosts:
-            return
-
-        tasks = [(host, port) for host in hosts for port in self.ports]
-        print(f"[+] Tasks number: {len(tasks)}")
 
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            future_to_task = {
-                executor.submit(self.scan_port, host, port): (host, port)
-                for host, port in tasks
-            }
-
+            futures = {}
             try:
-                for future in as_completed(future_to_task):
+                for host in self.ip_generator():
                     if self.stop_event.is_set():
                         break
+                    for port in self.ports:
+                        if self.stop_event.is_set():
+                            break
+                        future = executor.submit(self.scan_port, host, port)
+                        futures[future] = (host, port)
+
+                for future in as_completed(list(futures.keys())):
+                    if self.stop_event.is_set():
+                        break
+                    host, port = futures[future]
+                    del futures[future]
                     result = future.result()
-                    if result and result[2]:  # open
-                        host, port, _ = result
+                    if result and result[2]:
                         print(f"[OPEN] {host}:{port}")
                         self.append_or_update(host, port)
+
             except KeyboardInterrupt:
                 print("\n[!] Stopping...")
                 self.stop_event.set()
 
-            for future in future_to_task:
-                future.cancel()
+            for f in list(futures):
+                f.cancel()
 
         total_ports = sum(len(p) for p in self.host_ports.values())
         with self.file_lock:
@@ -180,7 +153,6 @@ class PortScanner:
 
         print(f"\n[+] Done! Hosts found: {len(self.open_ports_found)}, ports found: {total_ports}")
         print(f"[+] Result: {self.output_file}")
-
 
 def parse_ports(s: str) -> List[int]:
     ports = set()
@@ -193,7 +165,6 @@ def parse_ports(s: str) -> List[int]:
             ports.add(int(p))
     return sorted(ports)
 
-
 def main():
     parser = argparse.ArgumentParser(description="ezscan - A eazy, lightweight, multi-threaded Python port scanner.")
     parser.add_argument('-i', '--input', required=True)
@@ -202,15 +173,12 @@ def main():
     parser.add_argument('-p', '--ports', required=True)
     parser.add_argument('-n', '--timeout', type=int, default=3000)
     parser.add_argument('-l', '--look', type=int, choices=[1, 2], default=2)
-
     args = parser.parse_args()
-
     try:
         ports = parse_ports(args.ports)
     except:
         print("[!] Ports error. Example: 80,443 or 1-1000")
         sys.exit(1)
-
     scanner = PortScanner(
         input_file=args.input,
         output_file=args.output,
@@ -221,9 +189,5 @@ def main():
     )
     scanner.run()
 
-
 if __name__ == "__main__":
-    import threading
-
     main()
-
