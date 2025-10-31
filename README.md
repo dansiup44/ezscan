@@ -1,4 +1,4 @@
-[![ezscan](https://opengraph.githubassets.com/1/dansiup44/ezscan)](https://github.com/dansiup44/ezscan)
+![ezscan preview](https://opengraph.githubassets.com/1/dansiup44/ezscan)
 # ezscan - 📡A eazy, lightweight, multi-threaded Python port scanner.
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
