@@ -195,7 +195,7 @@ def parse_ports(s: str) -> List[int]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Сканнер портов с мгновенным выводом и Ctrl+C")
+    parser = argparse.ArgumentParser(description="ezscan - A eazy, lightweight, multi-threaded Python port scanner.")
     parser.add_argument('-i', '--input', required=True)
     parser.add_argument('-o', '--output', required=True)
     parser.add_argument('-t', '--threads', type=int, default=128)
@@ -208,7 +208,7 @@ def main():
     try:
         ports = parse_ports(args.ports)
     except:
-        print("[!] Err -p. Пример: 80,443 или 1-1000")
+        print("[!] Ports error. Example: 80,443 or 1-1000")
         sys.exit(1)
 
     scanner = PortScanner(
@@ -226,3 +226,4 @@ if __name__ == "__main__":
     import threading
 
     main()
+
