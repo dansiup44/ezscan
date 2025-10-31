@@ -4,7 +4,8 @@ import ipaddress
 import os
 import sys
 import signal
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from typing import List, Set, Dict, Generator
 from datetime import datetime
 import threading
@@ -13,9 +14,9 @@ class PortScanner:
     def __init__(self, input_file: str, output_file: str, threads: int, ports: List[int], timeout: float, look: int):
         self.input_file = input_file
         self.output_file = output_file
-        self.threads = threads
+        self.threads = max(1, threads)
         self.ports = ports
-        self.timeout = timeout / 1000
+        self.timeout = timeout / 1000.0
         self.look = look
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
@@ -26,18 +27,17 @@ class PortScanner:
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def signal_handler(self, sig, frame):
-        print("\n[!] Ctrl+C — Stopping scan...")
+        print("\n[!] Ctrl+C - Stopping scan...")
         self.stop_event.set()
 
     def write_header(self):
-        if os.path.exists(self.output_file):
-            return
         os.makedirs(os.path.dirname(self.output_file) or '.', exist_ok=True)
-        with open(self.output_file, 'w') as f:
-            f.write(f"# Scan started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Input: {self.input_file} | Threads: {self.threads} | Timeout: {self.timeout*1000}ms\n")
-            f.write(f"# Ports: {', '.join(map(str, self.ports))}\n")
-            f.write(f"# Format: {'IP' if self.look == 1 else 'IP:port,port,port'}\n\n")
+        if not os.path.exists(self.output_file):
+            with open(self.output_file, 'w') as f:
+                f.write(f"# Scan started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# Input: {self.input_file} | Threads: {self.threads} | Timeout: {int(self.timeout*1000)}ms\n")
+                f.write(f"# Ports: {', '.join(map(str, self.ports))}\n")
+                f.write(f"# Format: {'IP' if self.look == 1 else 'IP:port,port,port'}\n\n")
 
     def append_or_update(self, host: str, port: int):
         with self.lock:
@@ -67,13 +67,15 @@ class PortScanner:
             result = sock.connect_ex((host, port))
             sock.close()
             return (host, port, result == 0)
-        except:
+        except Exception:
             return (host, port, False)
 
     def ip_generator(self) -> Generator[str, None, None]:
         try:
             with open(self.input_file, 'r') as f:
                 for line in f:
+                    if self.stop_event.is_set():
+                        break
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
@@ -109,40 +111,87 @@ class PortScanner:
         print(f"[+] Input: {self.input_file}")
         print(f"[+] Output: {self.output_file}")
         print(f"[+] Threads: {self.threads}")
-        print(f"[+] Port: {', '.join(map(str, self.ports))}")
+        print(f"[+] Ports: {', '.join(map(str, self.ports))}")
         print(f"[+] Look: {'IP' if self.look == 1 else 'IP:Port'}")
-        print(f"[+] Ctrl+C — Stop scan\n")
+        print(f"[+] Ctrl+C - Stop scan\n")
 
         self.write_header()
 
+        max_pending = min(max(self.threads * len(self.ports) * 4, 512), 5000)
+
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {}
+            pending = set()
             try:
-                for host in self.ip_generator():
+                gen = self.ip_generator()
+                for host in gen:
                     if self.stop_event.is_set():
                         break
                     for port in self.ports:
                         if self.stop_event.is_set():
                             break
-                        future = executor.submit(self.scan_port, host, port)
-                        futures[future] = (host, port)
+                        if port < 1 or port > 65535:
+                            continue
+                        fut = executor.submit(self.scan_port, host, port)
+                        pending.add(fut)
+                        if len(pending) >= max_pending:
+                            done, _ = wait(pending, return_when=FIRST_COMPLETED, timeout=5)
+                            for d in done:
+                                pending.discard(d)
+                                try:
+                                    res = d.result()
+                                except Exception:
+                                    continue
+                                if res and res[2]:
+                                    h, p, _ = res
+                                    print(f"[OPEN] {h}:{p}")
+                                    self.append_or_update(h, p)
+                            gc.collect()
 
-                for future in as_completed(list(futures.keys())):
+                for d in as_completed(pending):
                     if self.stop_event.is_set():
                         break
-                    host, port = futures[future]
-                    del futures[future]
-                    result = future.result()
-                    if result and result[2]:
-                        print(f"[OPEN] {host}:{port}")
-                        self.append_or_update(host, port)
+                    try:
+                        res = d.result()
+                    except Exception:
+                        continue
+                    if res and res[2]:
+                        h, p, _ = res
+                        print(f"[OPEN] {h}:{p}")
+                        self.append_or_update(h, p)
 
             except KeyboardInterrupt:
                 print("\n[!] Stopping...")
                 self.stop_event.set()
 
-            for f in list(futures):
-                f.cancel()
+            for f in list(pending):
+                try:
+                    f.cancel()
+                except Exception:
+                    pass
+
+        if self.look != 1:
+            with self.file_lock:
+                try:
+                    if os.path.exists(self.output_file):
+                        with open(self.output_file, 'r') as f:
+                            lines = f.readlines()
+                        filtered = []
+                        for line in lines:
+                            if line.startswith('#') or not line.strip():
+                                filtered.append(line)
+                            else:
+                                first = line.split(':', 1)[0].strip()
+                                if first in self.written_hosts:
+                                    continue
+                                filtered.append(line)
+                        with open(self.output_file, 'w') as f:
+                            f.writelines(filtered)
+                            for host, ports in self.host_ports.items():
+                                f.write(f"{host}:{','.join(map(str, ports))}\n")
+                except Exception:
+                    with open(self.output_file, 'a') as f:
+                        for host, ports in self.host_ports.items():
+                            f.write(f"{host}:{','.join(map(str, ports))}\n")
 
         total_ports = sum(len(p) for p in self.host_ports.values())
         with self.file_lock:
@@ -158,15 +207,27 @@ def parse_ports(s: str) -> List[int]:
     ports = set()
     for p in s.split(','):
         p = p.strip()
+        if not p:
+            continue
         if '-' in p:
-            start, end = map(int, p.split('-'))
-            ports.update(range(start, end + 1))
+            try:
+                start, end = map(int, p.split('-', 1))
+                if start > end:
+                    start, end = end, start
+                ports.update(range(max(1, start), min(65535, end) + 1))
+            except Exception:
+                continue
         else:
-            ports.add(int(p))
+            try:
+                v = int(p)
+                if 1 <= v <= 65535:
+                    ports.add(v)
+            except Exception:
+                continue
     return sorted(ports)
 
 def main():
-    parser = argparse.ArgumentParser(description="ezscan - A eazy, lightweight, multi-threaded Python port scanner.")
+    parser = argparse.ArgumentParser(description="ezscan - A eazy, lightweight, multi-threaded TCP Python port scanner")
     parser.add_argument('-i', '--input', required=True)
     parser.add_argument('-o', '--output', required=True)
     parser.add_argument('-t', '--threads', type=int, default=128)
@@ -176,7 +237,9 @@ def main():
     args = parser.parse_args()
     try:
         ports = parse_ports(args.ports)
-    except:
+        if not ports:
+            raise ValueError("no valid ports")
+    except Exception:
         print("[!] Ports error. Example: 80,443 or 1-1000")
         sys.exit(1)
     scanner = PortScanner(
