@@ -107,7 +107,6 @@ class PortScanner:
 
     def run(self):
         print("[-] ezscan")
-        print(f"[+] Launching scan...")
         print(f"[+] Input: {self.input_file}")
         print(f"[+] Output: {self.output_file}")
         print(f"[+] Threads: {self.threads}")
@@ -254,3 +253,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
