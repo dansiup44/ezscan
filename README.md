@@ -11,7 +11,9 @@
 # Using:
 Launch: 
 
+```bash
 python ezscan.py -i [input] -o [output] -t [threads] -p [ports] -n [timeout] -l [look]
+```
 
 -i [input file (Ranges, CIDR, IP)] 
 
